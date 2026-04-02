@@ -57,6 +57,7 @@ type daemonState struct {
 	mu              sync.Mutex
 	db              *sql.DB
 	volume          rune
+	deltaLog        bool
 	currentUSN      int64
 	journalID       uint64
 	journalNextUSN  int64
@@ -243,6 +244,7 @@ func cmdServe(args []string) error {
 	addr := fs.String("addr", "127.0.0.1:7788", "listen addr")
 	flushSeconds := fs.Int("flush-seconds", 10, "flush interval")
 	chunkSize := fs.Int("chunk-size", 1024*1024, "DeviceIoControl output buffer")
+	deltaLog := fs.Bool("delta-log", false, "log every applied add/update/delete delta")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -289,6 +291,7 @@ func cmdServe(args []string) error {
 		st := &daemonState{
 			db:             db,
 			volume:         v,
+			deltaLog:       *deltaLog,
 			currentUSN:     startUSN,
 			journalID:      jd.USNJournalID,
 			journalNextUSN: jd.NextUSN,
@@ -763,8 +766,21 @@ func flushPending(st *daemonState) error {
 	defer tx.Rollback()
 
 	for _, r := range latest {
-		if err := applyLatestRecord(tx, st.volume, r); err != nil {
+		res, err := applyLatestRecord(tx, st.volume, r)
+		if err != nil {
 			return err
+		}
+		if st.deltaLog {
+			switch res.Action {
+			case "add":
+				log.Printf("delta volume=%c action=add id=%s name=%q path=%q reason=0x%08x attrs=0x%08x", st.volume, r.ID, r.Name, res.NewPath, r.Reason, r.FileAttributes)
+			case "delete":
+				log.Printf("delta volume=%c action=delete id=%s name=%q path=%q reason=0x%08x attrs=0x%08x", st.volume, r.ID, r.Name, res.OldPath, r.Reason, r.FileAttributes)
+			case "update":
+				log.Printf("delta volume=%c action=update id=%s name=%q old_path=%q new_path=%q reason=0x%08x attrs=0x%08x", st.volume, r.ID, r.Name, res.OldPath, res.NewPath, r.Reason, r.FileAttributes)
+			case "dir_move":
+				log.Printf("delta volume=%c action=dir_move id=%s name=%q old_path=%q new_path=%q descendants_updated=%d reason=0x%08x attrs=0x%08x", st.volume, r.ID, r.Name, res.OldPath, res.NewPath, res.SubtreeUpdated, r.Reason, r.FileAttributes)
+			}
 		}
 	}
 
@@ -780,10 +796,27 @@ func flushPending(st *daemonState) error {
 	return nil
 }
 
-func applyLatestRecord(tx *sql.Tx, volume rune, r usnRecord) error {
+type applyResult struct {
+	Action         string
+	OldPath        string
+	NewPath        string
+	SubtreeUpdated int64
+}
+
+func applyLatestRecord(tx *sql.Tx, volume rune, r usnRecord) (applyResult, error) {
+	var out applyResult
 	if (r.Reason & usnReasonFileDelete) != 0 {
+		existingPath := ""
+		_ = tx.QueryRow(`SELECT path FROM entries WHERE id=? LIMIT 1`, r.ID).Scan(&existingPath)
 		_, err := tx.Exec(`DELETE FROM entries WHERE id=?`, r.ID)
-		return err
+		if err != nil {
+			return out, err
+		}
+		if existingPath != "" {
+			out.Action = "delete"
+			out.OldPath = existingPath
+		}
+		return out, nil
 	}
 
 	parentPath := ""
@@ -809,7 +842,39 @@ ON CONFLICT(id) DO UPDATE SET
   reason=excluded.reason,
   file_attributes=excluded.file_attributes
 `, r.ID, r.ParentID, r.Name, isDir, path, r.USN, r.Reason, r.FileAttributes)
-	return err
+	if err != nil {
+		return out, err
+	}
+
+	if existingPath == "" {
+		out.Action = "add"
+		out.NewPath = path
+	} else {
+		out.Action = "update"
+		out.OldPath = existingPath
+		out.NewPath = path
+	}
+
+	// If a directory moved/renamed, rewrite descendant cached paths in-place.
+	if isDir == 1 && existingPath != "" && !strings.EqualFold(existingPath, path) {
+		oldPrefix := strings.TrimRight(existingPath, "\\") + "\\"
+		newPrefix := strings.TrimRight(path, "\\") + "\\"
+		if !strings.EqualFold(oldPrefix, newPrefix) {
+			res, err := tx.Exec(
+				`UPDATE entries SET path = ? || substr(path, ?) WHERE path LIKE ? COLLATE NOCASE`,
+				newPrefix,
+				len(oldPrefix)+1,
+				oldPrefix+"%",
+			)
+			if err != nil {
+				return out, err
+			}
+			updatedRows, _ := res.RowsAffected()
+			out.Action = "dir_move"
+			out.SubtreeUpdated = updatedRows
+		}
+	}
+	return out, nil
 }
 
 func derivePath(volume rune, parentPath, existingPath, name string) string {
@@ -1108,16 +1173,16 @@ func parseUSNRecordV2(rec []byte) (usnRecord, bool) {
 }
 
 func parseUSNRecordV3(rec []byte) (usnRecord, bool) {
-	if len(rec) < 68 {
+	if len(rec) < 76 {
 		return usnRecord{}, false
 	}
 	id := "0x" + hexLower(rec[8:24])
 	parent := "0x" + hexLower(rec[24:40])
 	usn := int64(binary.LittleEndian.Uint64(rec[40:48]))
-	reason := binary.LittleEndian.Uint32(rec[48:52])
-	attrs := binary.LittleEndian.Uint32(rec[60:64])
-	nameLen := int(binary.LittleEndian.Uint16(rec[64:66]))
-	nameOff := int(binary.LittleEndian.Uint16(rec[66:68]))
+	reason := binary.LittleEndian.Uint32(rec[56:60])
+	attrs := binary.LittleEndian.Uint32(rec[68:72])
+	nameLen := int(binary.LittleEndian.Uint16(rec[72:74]))
+	nameOff := int(binary.LittleEndian.Uint16(rec[74:76]))
 	if nameLen%2 != 0 || nameOff+nameLen > len(rec) {
 		return usnRecord{}, false
 	}
