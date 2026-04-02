@@ -48,7 +48,3 @@ Uninstall:
 ```powershell
 .\uninstall_service.ps1
 ```
-
-## Docs
-
-- Runbook: [RUNBOOK.md](RUNBOOK.md)
